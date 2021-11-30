@@ -16,6 +16,10 @@ class VOCDataset(Dataset):
         self.transform = transform
         self.image_root = image_root
         self.train = train
+        self.feature_map = [37, 18, 9, 5, 3, 1]
+        self.default_boxes = [4, 6, 6, 6, 4, 4]
+        self.num_category = 20
+        self.s_k = [0.2, 0.34, 0.48, 0.62, 0.76, 0.9, 1]
 
     def __len__(self):
         return len(self.data)
@@ -34,16 +38,16 @@ class VOCDataset(Dataset):
             hsv_img = self.saturation(hsv_img)
             hsv_img = self.value(hsv_img)
             img = cv.cvtColor(hsv_img, cv.COLOR_HSV2BGR)
-            # img = self.average_blur(img)
-            # img, bbox = self.horizontal_flip(img, bbox)
-            # img, bbox, category = self.crop(img, bbox, category)
+            img = self.average_blur(img)
+            img, bbox = self.horizontal_flip(img, bbox)
+            img, bbox, category = self.crop(img, bbox, category)
             img, bbox = self.scale(img, bbox)
             img, bbox, category = self.translation(img, bbox, category)
         # Caused by data augmentation, such as crop, translation and so on.
         if len(bbox) == 0 or len(category) == 0:
             return [], []
         target = self.encoder(img, bbox, category)
-        img = cv.resize(img, (448, 448))
+        img = cv.resize(img, (300, 300))
         img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
         if self.transform:
             img = self.transform(img)
@@ -158,15 +162,37 @@ class VOCDataset(Dataset):
 
     def encoder(self, img, bbox, category):
         h, w, _ = img.shape
-        w_scale_factor = 448 / w
-        h_scale_factor = 448 / h
+        w_scale_factor = 300 / w
+        h_scale_factor = 300 / h
         bbox[:, [0, 2]] = bbox[:, [0, 2]] * w_scale_factor
         bbox[:, [1, 3]] = bbox[:, [1, 3]] * h_scale_factor
-        h=w=448
-        grid = 7
-        target = np.zeros((7, 7, 30), dtype=np.float32)
-        center_x = (bbox[:, 0] + bbox[:, 2]) / 2
-        center_y = (bbox[:, 1] + bbox[:, 3]) / 2
+        ratio = np.array([1, 2, 3, 1/2, 1/3])
+        # feature map shape: 37, 18, 9, 5, 3, 1
+        # 输出default box个数 4, 6, 6, 6, 4, 4
+        final_target = []
+        for idx, (fm, db, s) in enumerate(zip(self.feature_map, self.default_boxes, self.s_k)):
+            target = np.zeros((db * (4 + self.num_category), fm, fm), dtype=np.float32)
+            center_x = np.linspace(150 / fm, 300 - 150 / fm, fm)  #37,
+            center_x = np.expand_dims(np.expand_dims(center_x, axis=-1), axis=-1) #37, 1, 1
+            center_x = np.repeat(center_x, 37, axis=1) # 37, 37
+            center_y = np.linspace(150 / fm, 300 - 150 / fm, fm)  #37,
+            center_y = np.expand_dims(np.expand_dims(center_y, axis=0), axis=-1)  # 1, 37, 1
+            center_y = np.repeat(center_y, 37, axis=0) # 37, 37, 1
+            h = 300 * s / ratio  # 5,
+            w = 300 * s * ratio  # 5,
+            h = np.concatenate((h, 300 * np.sqrt([s * self.s_k[idx + 1]]) / ratio), axis=0)  # 6,
+            h = np.expand_dims(np.expand_dims(h, axis=0), axis=0) # 1, 1, 6
+            h = np.repeat(np.repeat(h, 37, axis=1), 37, axis=0) # 37, 37, 6
+            w = np.concatenate((w, 300 * np.sqrt([s * self.s_k[idx + 1]]) * ratio), axis=0)  # 6,
+            w = np.expand_dims(np.expand_dims(w, axis=0), axis=0) # 1, 1, 6
+            w = np.repeat(np.repeat(w, 37, axis=1), 37, axis=0)  # 37, 37, 6
+            x1 = center_x - w  # 37, 37, 6
+            y1 = center_y - h
+            x2 = center_x + w
+            y2 = center_y + h
+            self.calculate_iou(bbox, x1, y1, x2, y2)
+            final_target.append(target)
+            
         width_each_cell = w / grid
         height_each_cell = h / grid
         location_x = (center_x / width_each_cell).astype(np.int)
@@ -192,3 +218,21 @@ class VOCDataset(Dataset):
         row_index = np.arange(len(label))
         one_hot_array[row_index, label] = 1
         return one_hot_array
+
+    def calculate_iou(self, bbox, x1, y1, x2, y2):
+        bbox = np.expand_dims(np.expand_dims(np.expand_dims(bbox, axis=1), axis=1), axis=1)  # N, 1, 1, 1, 4
+        x1 = np.expand_dims(x1, axis=0)  # 1, 37, 37, 6
+        y1 = np.expand_dims(y1, axis=0)  # 1, 37, 37, 6
+        x2 = np.expand_dims(x2, axis=0)  # 1, 37, 37, 6
+        y2 = np.expand_dims(y2, axis=0)  # 1, 37, 37, 6
+        l = np.maximum(bbox[:, :, :, :, 0], x1)
+        t = np.maximum(bbox[:, :, :, :, 1], y1)
+        r = np.minimum(bbox[:, :, :, :, 2], x2)
+        b = np.minimum(bbox[:, :, :, :, 3], y2)
+        w = np.maximum(r - l, np.array([0]))
+        h = np.maximum(b - t, np.array([0]))
+        intersec = w * h
+        union = (x2 - x1) * (y2 - y1) + (bbox[:, :, :, :, 2] - bbox[:, :, :, :, 0]) * \
+                (bbox[:, :, :, :, 3] - bbox[:, :, :, :, 1]) - intersec
+        iou = intersec / union
+        
