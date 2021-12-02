@@ -18,6 +18,7 @@ from torchvision import transforms
 
 from dataset import VOCDataset
 from network import SSDNet
+from loss import SSDLoss
 
 EXPERIMENT_NAME = "SSD"
 ex = Experiment(EXPERIMENT_NAME)
@@ -44,7 +45,7 @@ def load_data(data_path):
     res = []
     for i, path in enumerate(annotation_path):
         path_split = os.path.dirname(path).split('/')
-        folder = [path_split[3], path_split[4]] # [VOC2007/VOC2012, trainval/test]
+        folder = [path_split[2], path_split[3]] # [VOC2007/VOC2012, trainval/test]
         DOMTree = xdm.parse(path)
         collection = DOMTree.documentElement
         filename = collection.getElementsByTagName("filename")[0].childNodes[0].data
@@ -77,9 +78,9 @@ def collate_fn(batch):
 @ex.automain
 def main(_run):
     set_random_seeds(42)
-    DATA_PATH = "../../dataset"
+    DATA_PATH = "../dataset"
     BATCH_SIZE = 32
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 2e-4
     EPOCH = 1000
     PRINT_INTERVAL = 50
     SAVE_ROOT = os.path.join("models", EXPERIMENT_NAME, str(_run._id))
@@ -102,7 +103,7 @@ def main(_run):
     net = nn.DataParallel(net)
     net = net.cuda()
     #-----优化-----#
-    criterion = YOLOLoss(lambda_coord=5, lambda_noobj=0.5, grid=7)
+    criterion = SSDLoss()
     optimizer = torch.optim.SGD(net.parameters(), lr=LEARNING_RATE, momentum=0.9, weight_decay=0.0005)
     #-----迭代训练/验证-----#
     step = 0
@@ -115,8 +116,8 @@ def main(_run):
             optimizer.param_groups[0]['lr'] = 1e-5
         for iter_, (img, target) in enumerate(train_loader):
             img = img.cuda()
-            target = target.cuda() # bs, 7, 7, 30
-            out = net(img) # bs, 30, 7, 7
+            target = target.cuda() # bs, 8096, 5
+            out = net(img) # bs, 8096, 25
             loss = criterion(out, target)
             optimizer.zero_grad()
             loss.backward()
